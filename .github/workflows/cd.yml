@@ -97,13 +97,15 @@ jobs:
           (cd "$GITHUB_WORKSPACE" && zip -r "$ZIP_NAME" "deployment-package")
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
-      - name: Azure login (client secret)
+      # 🔐 FIXED LOGIN (uses AZURE_CREDENTIALS JSON)
+      - name: Azure Login (Service Principal)
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          auth-type: SERVICE_PRINCIPAL
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Verify Azure context
+        run: az account show
 
       - name: Upload deployment package artifact
         uses: actions/upload-artifact@v4.6.2
@@ -128,18 +130,15 @@ jobs:
             : "${AZ_STORAGE_KEY:?AZ_STORAGE_KEY missing}"
             : "${ZIP_NAME:?ZIP_NAME missing}"
 
-            # Trim stray whitespace/newlines in key
             AZ_STORAGE_KEY="$(printf %s "$AZ_STORAGE_KEY" | tr -d '\r\n')"
             export AZ_STORAGE_KEY
 
-            # Ensure container exists (idempotent)
             az storage container create \
               --name "$AZ_STORAGE_CONTAINER" \
               --account-name "$AZ_STORAGE_ACCOUNT" \
               --account-key "$AZ_STORAGE_KEY" \
               --only-show-errors 1>/dev/null
 
-            # Upload artifact
             echo "Uploading $ZIP_NAME ..."
             az storage blob upload \
               --account-name "$AZ_STORAGE_ACCOUNT" \
@@ -150,7 +149,6 @@ jobs:
               --overwrite true \
               --only-show-errors
 
-            # SAS URL for VM to download (1 hour)
             SAS=$(az storage blob generate-sas \
               --account-name "$AZ_STORAGE_ACCOUNT" \
               --account-key "$AZ_STORAGE_KEY" \
@@ -169,64 +167,51 @@ jobs:
           cat > deploy.sh << 'EOF'
           #!/bin/bash
           set -e
-
-          # Config
           APP_DIR="/opt/myapp"
           APP_NAME="myapp"
           APP_USER="azureuser"
           PACKAGE_URL="$1"
 
-          # Tools
           if ! command -v curl >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y curl; fi
           if ! command -v unzip >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y unzip; fi
           if ! command -v nc >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y netcat; fi
 
-          # Node 22
           if ! command -v node >/dev/null 2>&1 || ! node -v | grep -q "^v22"; then
             echo "Installing Node.js 22..."
             curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
             sudo apt-get install -y nodejs
           fi
 
-          # PM2
           if ! command -v pm2 >/dev/null 2>&1; then
             echo "Installing PM2..."
             sudo npm install -g pm2
           fi
 
-          # Folders
           sudo mkdir -p "$APP_DIR/releases" "$APP_DIR/current"
 
-          # Download package
           echo "Downloading package..."
           curl -fSL "$PACKAGE_URL" -o /tmp/app.zip
 
-          # Extract to new release directory
           RELEASE_DIR="$APP_DIR/releases/$(date +%Y%m%d-%H%M%S)"
           sudo mkdir -p "$RELEASE_DIR"
           unzip -o /tmp/app.zip -d "$RELEASE_DIR"
 
-          # Flatten "deployment-package"
           if [ -d "$RELEASE_DIR/deployment-package" ]; then
             sudo mv "$RELEASE_DIR/deployment-package"/* "$RELEASE_DIR/" 2>/dev/null || true
             sudo rmdir "$RELEASE_DIR/deployment-package" 2>/dev/null || true
           fi
 
-          # Ownership
           sudo chown -R "$APP_USER:$APP_USER" "$RELEASE_DIR"
 
-          # Install prod deps
           if [ -f "$RELEASE_DIR/package.json" ]; then
             echo "Installing dependencies..."
             sudo -u "$APP_USER" bash -c "cd '$RELEASE_DIR' && npm ci --omit=dev"
           fi
 
-          # Symlink deploy
           echo "Linking current -> $RELEASE_DIR"
           sudo rm -rf "$APP_DIR/current"
           sudo ln -sfn "$RELEASE_DIR" "$APP_DIR/current"
 
-          # PM2 start/reload (non-blocking)
           if sudo -u "$APP_USER" pm2 describe "$APP_NAME" >/dev/null 2>&1; then
             sudo -u "$APP_USER" pm2 reload "$APP_NAME"
           else
@@ -235,7 +220,6 @@ jobs:
           sudo -u "$APP_USER" pm2 save
           sudo -u "$APP_USER" pm2 startup systemd -u "$APP_USER" --hp "/home/$APP_USER" >/dev/null 2>&1 || true
 
-          # Basic health check (PORT defaults to 3000)
           PORT="${PORT:-3000}"
           for i in {1..30}; do
             if nc -z 127.0.0.1 "$PORT"; then
@@ -245,7 +229,6 @@ jobs:
             sleep 1
           done
 
-          # Cleanup
           rm -f /tmp/app.zip
           echo "Deployment completed successfully"
           EOF
@@ -259,7 +242,6 @@ jobs:
           PACKAGE_SAS_URL: ${{ env.PACKAGE_SAS_URL }}
         with:
           inlineScript: |
-            # Upload script to the VM
             az vm run-command invoke \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$AZURE_VM_NAME" \
@@ -269,7 +251,6 @@ jobs:
             DEPLOY_SCRIPT_EOF
             chmod +x /tmp/deploy.sh"
 
-            # Execute it with the SAS URL
             az vm run-command invoke \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$AZURE_VM_NAME" \
